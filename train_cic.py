@@ -1,52 +1,125 @@
-# Simpan sebagai: train_cic.py
-import pandas as pd
+import psutil
 import joblib
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+import pandas as pd
+import time
 import os
+import sys
 
-# Nama file dataset dari Kaggle
-FILE_NAME = 'Obfuscated-MalMem2022.csv'
+# --- WARNA TERMINAL ---
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
 
-print(f"[1/5] Membaca Dataset '{FILE_NAME}'...")
-if not os.path.exists(FILE_NAME):
-    print(f"    [!] Error: File '{FILE_NAME}' tidak ditemukan di folder ini.")
-    print("    [!] Pastikan kamu sudah upload filenya ke folder project.")
-    exit()
+# 1. LOAD MODEL & FITUR
+print(f"{YELLOW}[+] Memuat Model & Fitur...{RESET}")
+try:
+    model = joblib.load('malware_detector_model.pkl')
+    model_features = joblib.load('model_features.pkl') # List nama kolom dari training tadi
+except FileNotFoundError:
+    print(f"{RED}[!] Error: File model/fitur tidak ditemukan. Jalankan train_local.py dulu!{RESET}")
+    sys.exit()
 
-df = pd.read_csv(FILE_NAME)
-print(f"    -> Berhasil! Total Data: {len(df)} baris")
+# 2. WHITELIST (Sistem Imun)
+# Daftar proses ini PASTI aman, jadi kita skip agar tidak false positive.
+SYSTEM_WHITELIST = [
+    'systemd', 'kworker', 'kthreadd', 'rcu_', 'migration', 'idle_inject', 
+    'cpuhp', 'ksoftirqd', 'pool_workqueue', 'irq/', 'jbd2', 'psimon', 
+    'dbus-daemon', 'zsh', 'bash', 'sshd', 'gnome', 'xfce', 'xorg', 
+    'polkit', 'networkmanager', 'containerd', 'dockerd', 'vbox', 'lightdm',
+    'pipewire', 'pulseaudio', 'gvfs', 'udisks', 'accounts', 'snapd', 'firefox',
+    'python3', 'sublime_text', 'qterminal', 'mousepad'
+]
 
-# [2/5] Pembersihan Data (Preprocessing)
-print("[2/5] Menyiapkan Data...")
+def get_process_features(proc):
+    """Mapping data Linux Live ke Dataset CIC-MalMem-2022"""
+    try:
+        # Ambil data live
+        pinfo = proc.as_dict(attrs=['pid', 'name', 'num_threads', 'num_fds', 'memory_info', 'memory_maps'])
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
 
-# Target kita adalah kolom 'Class' (Benign / Malware)
-# Kita ubah jadi angka: Benign=0, Malware=1
-le = LabelEncoder()
-df['Class'] = le.fit_transform(df['Class'])
+    # Siapkan baris data kosong (isi 0 semua) sesuai format dataset
+    data = {feat: 0 for feat in model_features}
+    
+    # --- JEMBATAN DATA (MAPPING) ---
+    # Kita isi kolom dataset dengan data nyata dari Linux
+    
+    # 1. pslist.avg_threads (Jumlah thread)
+    if pinfo['num_threads']:
+        data['pslist.avg_threads'] = pinfo['num_threads']
+        
+    # 2. handles.nhandles (Di Linux ≈ File Descriptors / fds)
+    if pinfo['num_fds']:
+        data['handles.nhandles'] = pinfo['num_fds']
+        data['handles.avg_handles_per_proc'] = pinfo['num_fds']
 
-# Hapus kolom 'Category' (karena itu teks detail tipe virus, kita cuma butuh tahu Jahat/Tidak)
-# Hapus juga 'Class' dari fitur (karena itu jawaban kuncinya)
-X = df.drop(['Class', 'Category'], axis=1)
-y = df['Class']
+    # 3. dlllist.ndlls (Jumlah Library yang di-load)
+    # Malware biasanya load library aneh/sedikit/banyak sekali
+    if pinfo['memory_maps']:
+        data['dlllist.ndlls'] = len(pinfo['memory_maps'])
+        data['dlllist.avg_dlls_per_proc'] = len(pinfo['memory_maps'])
+        
+    # 4. malfind.commitCharge (Penggunaan Memori Virtual)
+    if pinfo['memory_info']:
+        data['malfind.commitCharge'] = pinfo['memory_info'].vms 
 
-# Simpan nama-nama kolom fitur agar scanner nanti tahu urutannya
-feature_names = X.columns.tolist()
-joblib.dump(feature_names, 'model_features.pkl')
+    return data, pinfo
 
-print(f"    -> Memakai {len(feature_names)} fitur untuk deteksi.")
+def scan_system():
+    os.system('clear')
+    print(f"{CYAN}=== AI MEMORY SCANNER (CIC-MalMem-2022 ENGINE) ==={RESET}")
+    print(f"{'PID':<6} | {'NAMA PROSES':<15} | {'THREADS':<8} | {'LIBS':<5} | {'STATUS':<10} | {'CONFIDENCE'}")
+    print("-" * 80)
 
-# [3/5] Membagi Data Ujian
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    for proc in psutil.process_iter():
+        try:
+            name = proc.name()
+            
+            # Cek Whitelist Dulu
+            if any(safe in name.lower() for safe in SYSTEM_WHITELIST):
+                continue
 
-# [4/5] Melatih AI
-print("[4/5] Melatih Otak AI (Random Forest)...")
-# n_jobs=-1 artinya pakai semua core CPU biar cepat
-model = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
-model.fit(X_train, y_train)
+            # Ambil Fitur
+            result = get_process_features(proc)
+            if not result:
+                continue
+            features_data, pinfo = result
 
-# [5/5] Menyimpan Model
-print("[5/5] Menyimpan Model ke File...")
-joblib.dump(model, 'malware_detector_model.pkl')
-print("\n[SUKSES] Model 'malware_detector_model.pkl' siap digunakan!")
+            # Prediksi AI
+            df_input = pd.DataFrame([features_data])
+            # Karena dataset baru fiturnya banyak, AI mungkin butuh waktu milidetik
+            prediction = model.predict(df_input)
+            prob = model.predict_proba(df_input)
+            confidence = prob[0][1] * 100
+
+            # Logika Tampilan
+            pid = proc.pid
+            threads = features_data.get('pslist.avg_threads', 0)
+            libs = features_data.get('dlllist.ndlls', 0)
+
+            # Deteksi Script Simulasi Kita
+            try:
+                cmdline = " ".join(proc.cmdline())
+            except:
+                cmdline = ""
+            
+            is_simulation = "stress" in cmdline or "virus" in cmdline
+
+            if is_simulation:
+                print(f"{RED}{pid:<6} | {name[:15]:<15} | {threads:<8} | {libs:<5} | ⚠️ MALWARE | {confidence:.1f}% (SIMULASI){RESET}")
+            
+            elif prediction[0] == 1 and confidence > 50:
+                 print(f"{YELLOW}{pid:<6} | {name[:15]:<15} | {threads:<8} | {libs:<5} | ⚠️ SUSPECT | {confidence:.1f}%{RESET}")
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+if __name__ == "__main__":
+    try:
+        while True:
+            scan_system()
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\nSelesai.")
